@@ -1,5 +1,7 @@
 import { generateText } from 'ai'
+import { cookies } from 'next/headers'
 import { NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
 
 type Source = { title: string; detail: string; score: string }
 type HistoryMessage = { role?: string; content?: string }
@@ -31,11 +33,20 @@ export async function POST(request: Request) {
   const messages = Array.isArray(body?.messages) ? body.messages.filter((message) => typeof message.content === 'string').slice(-12) : []
   if (!question || question.length > 1200) return NextResponse.json({ error: 'Enter a question under 1200 characters.' }, { status: 400 })
   const retrieved = retrieve(question)
+  const cookieStore = await cookies()
+  const ownerKey = cookieStore.get('clinical-rag-owner')?.value
+  let memories: { memory_type: string; content: string }[] = []
+  if (ownerKey) {
+    const supabase = await createClient()
+    const memoryResult = await supabase.from('user_memories').select('memory_type, content').eq('owner_key', ownerKey).order('updated_at', { ascending: false }).limit(20)
+    memories = memoryResult.data ?? []
+  }
   const sources = retrieved.map(({ title, detail, score }) => ({ title, detail, score }))
   const transcript = messages.map((message) => `${message.role === 'assistant' ? 'Assistant' : 'User'}: ${message.content}`).join('\n')
   const context = retrieved.map((item) => `${item.title}: ${item.evidence}`).join('\n')
   try {
-    const result = await generateText({ model: 'openai/o4-mini', system: `You are a cautious clinical knowledge assistant. Answer only from the retrieved evidence below. If the evidence does not support the question, say so. Treat a clearly new topic as standalone and use history only to resolve pronouns or follow-up references. Never diagnose, prescribe, or provide individualized dosing.\n\nRetrieved evidence:\n${context}`, prompt: `Conversation history:\n${transcript || '(none)'}\n\nLatest question: ${question}` })
+    const memoryContext = memories.length ? memories.map((memory) => `${memory.memory_type}: ${memory.content}`).join('\n') : '(none)'
+    const result = await generateText({ model: 'openai/o4-mini', system: `You are a cautious clinical knowledge assistant. Answer only from the retrieved evidence below. If the evidence does not support the question, say so. Treat a clearly new topic as standalone and use history only to resolve pronouns or follow-up references. Use long-term memory only as user context, never as clinical evidence. Never diagnose, prescribe, or provide individualized dosing.\n\nRetrieved evidence:\n${context}\n\nLong-term user memory:\n${memoryContext}`, prompt: `Conversation history:\n${transcript || '(none)'}\n\nLatest question: ${question}` })
     return NextResponse.json({ answer: result.text, sources, retrievedCount: retrieved.length })
   } catch (error) {
     console.error('[v0] Evidence generation failed:', error instanceof Error ? error.message : error)
