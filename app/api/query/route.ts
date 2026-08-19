@@ -74,8 +74,25 @@ export async function POST(request: Request) {
   const retrieval = retrieve(question)
   const retrieved = retrieval.results
   if (DEBUG_RAG) {
-    console.log('[v0] RAG retrieval', { conversationId, question, topK: RETRIEVAL_TOP_K, chunkSize: CHUNK_SIZE, chunkOverlap: CHUNK_OVERLAP, status: retrieval.status, retrievedCount: retrieved.length })
-    retrieved.forEach((item, index) => console.log('[v0] RAG result', { rank: index + 1, id: item.id, title: item.title, similarity: item.similarity, matchedTerms: item.matchedTerms, chunkPreview: item.evidence.slice(0, 240) }))
+    console.log('[RAG DEBUG]')
+    console.log('Original query:\n' + question)
+    console.log('Generated query:\n' + question)
+    console.log('Embedding generated:\nNO — no embedding provider is configured')
+    console.log('Vector search executed:\nNO — Supabase has no vector/document table; retrieval uses the in-process adapter')
+    console.log('Retrieval configuration:', { conversationId, topK: RETRIEVAL_TOP_K, similarityThreshold: 0.35, chunkSize: CHUNK_SIZE, chunkOverlap: CHUNK_OVERLAP, embeddingModel: 'none', queryEmbeddingDimension: null, documentEmbeddingDimension: null })
+    console.log('Retrieved documents:\n' + retrieved.length)
+    retrieved.forEach((item, index) => console.log({
+      'Document index': index + 1,
+      'Document ID': item.id,
+      'Similarity score': item.similarity,
+      Metadata: { title: item.title, detail: item.detail, matchedTerms: item.matchedTerms },
+      'First 500 characters of content': item.evidence.slice(0, 500),
+    }))
+    console.log('Documents after filtering:\n' + retrieved.length)
+    console.log('Final context length:\n' + retrieved.map((item) => item.evidence).join('\\n').length)
+    console.log('Fallback triggered:\n' + (!retrieved.length ? 'YES' : 'NO'))
+    console.log('Fallback reason:\n' + (!retrieved.length ? 'no lexical match in indexed in-process corpus' : 'none'))
+    console.log('LLM called:\n' + (retrieved.length ? 'YES' : 'NO'))
   }
 
   const sources = retrieved.map(({ id, title, detail, score }) => ({ id, title, detail, score }))
@@ -116,9 +133,16 @@ Long-term user memory is personalization only, never clinical evidence:
 ${memoryContext}`,
       prompt: `Conversation history:\n${transcript || '(none)'}\n\nLatest user question: ${question}`,
     })
-    return NextResponse.json({ answer: result.text, sources, retrievedCount: retrieved.length, retrievalStatus: 'ok', generationStatus: 'ok' })
+    if (DEBUG_RAG) console.log('Final answer generated:\nYES')
+    return NextResponse.json({ answer: result.text, sources, retrievedCount: retrieved.length, retrievalStatus: 'ok', generationStatus: 'ok', fallbackTriggered: false })
   } catch (error) {
-    console.error('[v0] LLM generation failed', { error: error instanceof Error ? error.message : error, retrievedCount: retrieved.length })
-    return NextResponse.json({ answer: groundedFallback(retrieved), sources, retrievedCount: retrieved.length, retrievalStatus: 'ok', generationStatus: 'error', degraded: true })
+    const reason = error instanceof Error ? error.message : 'unknown LLM error'
+    console.error('[v0] LLM generation failed', { error: reason, retrievedCount: retrieved.length })
+    if (DEBUG_RAG) {
+      console.log('Final answer generated:\nNO')
+      console.log('Fallback triggered:\nYES')
+      console.log('Fallback reason:\nLLM generation failed after relevant retrieval: ' + reason)
+    }
+    return NextResponse.json({ answer: groundedFallback(retrieved), sources, retrievedCount: retrieved.length, retrievalStatus: 'ok', generationStatus: 'error', fallbackTriggered: true, fallbackReason: 'llm_generation_failed', degraded: true })
   }
 }
