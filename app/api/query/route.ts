@@ -26,20 +26,18 @@ const evidence: Evidence[] = [
 function retrieve(question: string) {
   const terms = question.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter((term) => term.length > 2)
   const corpus = [...topicEvidence, ...evidence]
-  const ranked = corpus.map((item) => ({ ...item, hits: terms.filter((term) => item.keywords.some((keyword) => keyword === term || keyword.includes(term) || term.includes(keyword))).length })).sort((a, b) => b.hits - a.hits)
-  return ranked.some((item) => item.hits > 0) ? ranked.filter((item) => item.hits > 0).slice(0, 3) : ranked.slice(-3)
+  const ranked = corpus.map((item) => ({ ...item, hits: terms.filter((term) => item.keywords.some((keyword) => keyword === term)).length })).sort((a, b) => b.hits - a.hits)
+  // A non-empty nearest-neighbor result is not sufficient evidence. Require a lexical hit
+  // until a persisted embedding/vector index is available; otherwise unrelated chunks leak in.
+  return ranked.filter((item) => item.hits > 0).slice(0, 3)
 }
 
-function fallback(question: string, retrieved: Evidence[]) {
-  const lower = question.toLowerCase()
-  if (lower.includes('rag') || lower.includes('retrieval augmented')) return 'RAG, or Retrieval-Augmented Generation, retrieves relevant document chunks before asking a language model to generate an answer grounded in those sources. This helps reduce unsupported responses while keeping the model useful for synthesis.'
-  if (lower.includes('faiss')) return 'FAISS is a library for efficient similarity search and clustering of dense vectors. In a RAG system it can index embeddings and return the nearest document chunks for a new query.'
-  if (lower.includes('mongodb')) return 'MongoDB is a document-oriented NoSQL database. It stores flexible BSON documents in collections and supports indexed queries and aggregation.'
-  if (lower.includes('etl')) return 'ETL means Extract, Transform, Load: data is collected from source systems, cleaned or reshaped, and loaded into a target such as a data warehouse.'
-  if (lower.includes('pneumonia') || lower.includes('cap')) return `For adult community-acquired pneumonia, treatment is selected according to outpatient versus inpatient care, comorbidities, illness severity, allergies, recent antibiotic exposure, and local resistance patterns. The indexed guidance supports using those factors to choose empiric therapy, but it does not provide an individualized regimen or dose for a specific patient. A clinician should confirm the diagnosis, severity, contraindications, and treatment plan.`
-  if (lower.includes('drug') || lower.includes('medication') || lower.includes('antibiotic')) return `Medication decisions should be checked against allergies, renal and hepatic function, interactions, adverse effects, and patient-specific contraindications. The retrieved pharmacology reference supports a safety review before prescribing; it cannot determine an individual patient's regimen without clinical details.`
-  if (lower.includes('diagnos') || lower.includes('triage') || lower.includes('severity')) return `Clinical evaluation should establish the working diagnosis and assess severity before treatment selection. The retrieved risk-stratification reference notes that scores can support triage, but they do not replace clinician judgment or bedside assessment.`
-  return `I found limited directly matching evidence for “${question}”. The indexed clinical references support cautious, source-grounded review, but they do not provide enough evidence to answer this question reliably. Try asking about adult community-acquired pneumonia, treatment selection, medication safety, or clinical severity.`
+function fallback() {
+  return `I couldn't find enough relevant information in the indexed documents to answer this question reliably.`
+}
+
+function groundedFallback(retrieved: Evidence[]) {
+  return `Based on the relevant indexed documents: ${retrieved.map((item) => item.evidence).join(' ')}`
 }
 
 export async function POST(request: Request) {
@@ -56,22 +54,29 @@ export async function POST(request: Request) {
     console.log('CONVERSATION ID:\n' + conversationId)
     console.log('MEMORY QUERY:\n' + question)
     console.log('RETRIEVED MEMORIES:\n(memory disabled for isolation test)')
-    console.log('RETRIEVAL QUERY:\n' + question)
-    console.log('RETRIEVED DOCUMENTS:\n' + retrieved.map((item) => item.title + ' :: ' + item.evidence).join('\n'))
+    console.log('CONTEXTUALIZED QUERY:\n' + question)
+    console.log('QUERY USED FOR EMBEDDING:\n' + question)
+    console.log('TOP K:\n3')
+    retrieved.forEach((item, index) => console.log(`RESULT ${index + 1}:\nDocument: ${item.title}\nScore: ${item.score}\nChunk: ${item.evidence}`))
+    console.log('RETRIEVED DOCUMENTS:\n' + (retrieved.length ? retrieved.map((item) => item.title + ' :: ' + item.evidence).join('\n') : '(none)'))
     console.log('LLM REQUEST CREATED:\nYES')
     console.log('================================')
   }
   const cookieStore = await cookies()
   const ownerKey = cookieStore.get('clinical-rag-owner')?.value
   let memories: { memory_type: string; content: string }[] = []
-  if (ownerKey) {
+  if (ownerKey && !DEBUG_RAG) {
     const supabase = await createClient()
     const memoryResult = await supabase.from('user_memories').select('memory_type, content').eq('owner_key', ownerKey).order('updated_at', { ascending: false }).limit(20)
     memories = memoryResult.data ?? []
   }
   const sources = retrieved.map(({ title, detail, score }) => ({ title, detail, score }))
-  const transcript = messages.map((message) => `${message.role === 'assistant' ? 'Assistant' : 'User'}: ${message.content}`).join('\n')
-  const context = retrieved.map((item) => `${item.title}: ${item.evidence}`).join('\n')
+  const transcript = messages.map((message) => `${message.role === 'assistant' ? 'Assistant' : 'User'}: ${message.content}`).join('\\n')
+  const context = retrieved.map((item) => `${item.title}: ${item.evidence}`).join('\\n')
+  if (!retrieved.length) {
+    if (DEBUG_RAG) console.log('NO RELEVANT DOCUMENTS: returning generic fallback without LLM generation')
+    return NextResponse.json({ answer: fallback(), sources: [], retrievedCount: 0, degraded: true })
+  }
   try {
     const memoryContext = memories.length ? memories.map((memory) => `${memory.memory_type}: ${memory.content}`).join('\n') : '(none)'
     if (DEBUG_RAG) console.log('FINAL LLM PROMPT QUESTION:\n' + question + '\nCONTEXT:\n' + context)
@@ -79,6 +84,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ answer: result.text, sources, retrievedCount: retrieved.length })
   } catch (error) {
     console.error('[v0] Evidence generation failed:', error instanceof Error ? error.message : error)
-    return NextResponse.json({ answer: fallback(question, retrieved), sources, retrievedCount: retrieved.length, degraded: true })
+    return NextResponse.json({ answer: groundedFallback(retrieved), sources, retrievedCount: retrieved.length, degraded: true })
   }
 }
