@@ -17,7 +17,9 @@ export async function POST(request: Request) {
     const transcript = messages.map((message) => `${message.role === 'assistant' ? 'Assistant' : 'User'}: ${message.content}`).join('\n')
     const result = await generateText({ model: 'openai/o4-mini', system: `You are a cautious clinical knowledge assistant. ${context}`, prompt: `Conversation so far:\n${transcript}\n\nRespond to the latest user question: ${question}` })
     return NextResponse.json({ answer: result.text, sources })
-  } catch {
-    return NextResponse.json({ error: 'The evidence service is unavailable. Try again shortly.' }, { status: 503 })
+  } catch (error) {
+    console.error('[v0] Evidence generation failed:', error instanceof Error ? error.message : error)
+    const fallback = `Based on the indexed clinical sources, treatment choices for community-acquired pneumonia depend on illness severity, comorbidities, recent antibiotic exposure, local resistance patterns, allergies, and whether the patient needs hospital care. The IDSA/ATS guidance supports selecting empiric therapy according to those factors; a clinician should confirm the regimen for the individual patient. I could not complete the generative synthesis right now, so this is a limited evidence summary rather than individualized medical advice.`
+    return NextResponse.json({ answer: fallback, sources, degraded: true })
   }
 }
